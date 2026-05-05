@@ -1,0 +1,108 @@
+{
+    "food": [
+        "groceries",
+        "fruits_vegetables",
+        "dairy_bakery",
+        "meat_seafood",
+        "beverages",
+        "snacks_candy",
+        "frozen_foods",
+        "pantry_staples",
+        "organic_health_foods"
+    ],
+    "transportation": [
+        "fuel_gas",
+        "public_transport",
+        "taxi_rideshare",
+        "parking_tolls",
+        "vehicle_maintenance",
+        "car_insurance",
+        "vehicle_registration"
+    ],
+    "housing": [
+        "rent_mortgage",
+        "utilities_electricity",
+        "utilities_water",
+        "utilities_gas",
+        "internet_cable",
+        "home_insurance",
+        "property_taxes",
+        "home_maintenance",
+        "furniture_appliances"
+    ],
+    "healthcare": [
+        "doctor_visits",
+        "prescription_medications",
+        "dental_care",
+        "vision_care",
+        "health_insurance",
+        "medical_supplies",
+        "mental_health"
+    ],
+    "entertainment": [
+        "movies_theater",
+        "streaming_services",
+        "concerts_events",
+        "books_magazines",
+        "games_hobbies",
+        "sports_activities",
+        "dining_out"
+    ],
+    "shopping": [
+        "clothing_shoes",
+        "electronics",
+        "home_goods",
+        "personal_care",
+        "gifts",
+        "online_purchases",
+        "miscellaneous_retail"
+    ],
+    "education": [
+        "tuition_fees",
+        "books_supplies",
+        "online_courses",
+        "workshops_seminars",
+        "certification_exams"
+    ],
+    "financial": [
+        "bank_fees",
+        "investment_contributions",
+        "loan_payments",
+        "credit_card_payments",
+        "insurance_premiums",
+        "taxes",
+        "financial_services"
+    ],
+    "travel": [
+        "flights",
+        "hotels_accommodation",
+        "car_rentals",
+        "travel_insurance",
+        "meals_while_traveling",
+        "activities_tours",
+        "travel_gear"
+    ],
+    "personal": [
+        "haircuts_salon",
+        "gym_fitness",
+        "subscriptions",
+        "charitable_donations",
+        "pet_expenses",
+        "childcare",
+        "personal_development"
+    ],
+    "leisure": [
+        "recreational_activities",
+        "outdoor_adventures",
+        "social_gatherings",
+        "relaxation_spa",
+        "crafts_diy",
+        "photography",
+        "music_instruments",
+        "dance_classes",
+        "cooking_classes",
+        "wine_tasting",
+        "festivals_fairs",
+        "amusement_parks"
+    ]
+}
