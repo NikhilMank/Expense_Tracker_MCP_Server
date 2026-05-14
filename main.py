@@ -14,26 +14,69 @@ from fastmcp.server.dependencies import get_access_token
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "expenses.db")
 CATEGORIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "categories.json")
 
-mcp = FastMCP("Expense-Tracker", lifespan="auto")
+mcp = FastMCP("Expense-Tracker")
 
+_db_initialized = False
 
-# ── lifespan (startup/shutdown) ───────────────────────────────────────────────
-
-@mcp.lifecycle
-async def lifespan(server: FastMCP):
-    await init_db()
-    yield
 
 @asynccontextmanager
 async def get_conn():
+    global _db_initialized
     async with aiosqlite.connect(DB_PATH) as conn:
         conn.row_factory = aiosqlite.Row
+        if not _db_initialized:
+            await _init_schema(conn)
+            _db_initialized = True
         try:
             yield conn
             await conn.commit()
         except Exception:
             await conn.rollback()
             raise
+
+
+async def _init_schema(conn):
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS expenses (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            date         TEXT    NOT NULL,
+            amount       REAL    NOT NULL CHECK(amount > 0),
+            category     TEXT    NOT NULL,
+            subcategory  TEXT    DEFAULT '',
+            note         TEXT    DEFAULT '',
+            is_recurring INTEGER DEFAULT 0,
+            user_id      TEXT    NOT NULL DEFAULT 'anonymous',
+            created_at   TEXT    DEFAULT (datetime('now'))
+        )
+    """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS budgets (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            category   TEXT    NOT NULL,
+            month      TEXT    NOT NULL,
+            amount     REAL    NOT NULL CHECK(amount > 0),
+            user_id    TEXT    NOT NULL DEFAULT 'anonymous',
+            created_at TEXT    DEFAULT (datetime('now')),
+            UNIQUE(user_id, category, month)
+        )
+    """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS categories (
+            id     INTEGER PRIMARY KEY AUTOINCREMENT,
+            name   TEXT NOT NULL UNIQUE,
+            parent TEXT DEFAULT NULL
+        )
+    """)
+    if os.path.exists(CATEGORIES_PATH):
+        with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for parent, children in data.items():
+            await conn.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (parent,))
+            for child in children:
+                await conn.execute(
+                    "INSERT OR IGNORE INTO categories (name, parent) VALUES (?, ?)",
+                    (child, parent),
+                )
 
 
 def _get_user_id() -> str:
@@ -68,56 +111,6 @@ def validate_amount(value: float) -> float:
 
 async def rows_to_dicts(cursor) -> list[dict]:
     return [dict(row) for row in await cursor.fetchall()]
-
-
-# ── schema init ───────────────────────────────────────────────────────────────
-
-async def init_db():
-    async with get_conn() as conn:
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS expenses (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                date         TEXT    NOT NULL,
-                amount       REAL    NOT NULL CHECK(amount > 0),
-                category     TEXT    NOT NULL,
-                subcategory  TEXT    DEFAULT '',
-                note         TEXT    DEFAULT '',
-                is_recurring INTEGER DEFAULT 0,
-                user_id      TEXT    NOT NULL DEFAULT 'anonymous',
-                created_at   TEXT    DEFAULT (datetime('now'))
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS budgets (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                category   TEXT    NOT NULL,
-                month      TEXT    NOT NULL,
-                amount     REAL    NOT NULL CHECK(amount > 0),
-                user_id    TEXT    NOT NULL DEFAULT 'anonymous',
-                created_at TEXT    DEFAULT (datetime('now')),
-                UNIQUE(user_id, category, month)
-            )
-        """)
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS categories (
-                id     INTEGER PRIMARY KEY AUTOINCREMENT,
-                name   TEXT NOT NULL UNIQUE,
-                parent TEXT DEFAULT NULL
-            )
-        """)
-        # One-time migration from categories.json → DB
-        cursor = await conn.execute("SELECT COUNT(*) FROM categories")
-        row = await cursor.fetchone()
-        if (row is None or row[0] == 0) and os.path.exists(CATEGORIES_PATH):
-            with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            for parent, children in data.items():
-                await conn.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (parent,))
-                for child in children:
-                    await conn.execute(
-                        "INSERT OR IGNORE INTO categories (name, parent) VALUES (?, ?)",
-                        (child, parent),
-                    )
 
 
 # ── expense CRUD ──────────────────────────────────────────────────────────────
