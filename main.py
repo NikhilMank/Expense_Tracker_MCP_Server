@@ -1,10 +1,16 @@
 import os
 import json
-import sqlite3
+import aiosqlite
+import asyncio
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
 
 from fastmcp import FastMCP
+from fastmcp.server.dependencies import get_access_token
+
+
+# Create a temporary database file
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "expenses.db")
 CATEGORIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "categories.json")
@@ -14,10 +20,24 @@ mcp = FastMCP("Expense-Tracker")
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
+@asynccontextmanager
+async def get_conn():
+    async with aiosqlite.connect(DB_PATH) as conn:
+        conn.row_factory = aiosqlite.Row
+        try:
+            yield conn
+            await conn.commit()
+        except Exception:
+            await conn.rollback()
+            raise
+
+
+def _get_user_id() -> str:
+    """Return the authenticated user's subject claim, or 'anonymous' when auth is off."""
+    token = get_access_token()
+    if token is None:
+        return "anonymous"
+    return token.claims.get("sub") or token.client_id or "anonymous"
 
 
 def validate_date(value: str) -> str:
@@ -42,15 +62,15 @@ def validate_amount(value: float) -> float:
     return value
 
 
-def rows_to_dicts(cursor) -> list[dict]:
-    return [dict(row) for row in cursor.fetchall()]
+async def rows_to_dicts(cursor) -> list[dict]:
+    return [dict(row) for row in await cursor.fetchall()]
 
 
 # ── schema init ───────────────────────────────────────────────────────────────
 
-def init_db():
-    with get_conn() as conn:
-        conn.execute("""
+async def init_db():
+    async with get_conn() as conn:
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS expenses (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
                 date         TEXT    NOT NULL,
@@ -59,20 +79,22 @@ def init_db():
                 subcategory  TEXT    DEFAULT '',
                 note         TEXT    DEFAULT '',
                 is_recurring INTEGER DEFAULT 0,
+                user_id      TEXT    NOT NULL DEFAULT 'anonymous',
                 created_at   TEXT    DEFAULT (datetime('now'))
             )
         """)
-        conn.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS budgets (
                 id         INTEGER PRIMARY KEY AUTOINCREMENT,
                 category   TEXT    NOT NULL,
                 month      TEXT    NOT NULL,
                 amount     REAL    NOT NULL CHECK(amount > 0),
+                user_id    TEXT    NOT NULL DEFAULT 'anonymous',
                 created_at TEXT    DEFAULT (datetime('now')),
-                UNIQUE(category, month)
+                UNIQUE(user_id, category, month)
             )
         """)
-        conn.execute("""
+        await conn.execute("""
             CREATE TABLE IF NOT EXISTS categories (
                 id     INTEGER PRIMARY KEY AUTOINCREMENT,
                 name   TEXT NOT NULL UNIQUE,
@@ -80,26 +102,27 @@ def init_db():
             )
         """)
         # One-time migration from categories.json → DB
-        count = conn.execute("SELECT COUNT(*) FROM categories").fetchone()[0]
-        if count == 0 and os.path.exists(CATEGORIES_PATH):
+        cursor = await conn.execute("SELECT COUNT(*) FROM categories")
+        row = await cursor.fetchone()
+        if (row is None or row[0] == 0) and os.path.exists(CATEGORIES_PATH):
             with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
             for parent, children in data.items():
-                conn.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (parent,))
+                await conn.execute("INSERT OR IGNORE INTO categories (name) VALUES (?)", (parent,))
                 for child in children:
-                    conn.execute(
+                    await conn.execute(
                         "INSERT OR IGNORE INTO categories (name, parent) VALUES (?, ?)",
                         (child, parent),
                     )
 
 
-init_db()
+asyncio.run(init_db())
 
 
 # ── expense CRUD ──────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def add_expense(
+async def add_expense(
     date: str,
     amount: float,
     category: str,
@@ -113,11 +136,12 @@ def add_expense(
     if not category.strip():
         raise ValueError("category cannot be empty.")
 
-    with get_conn() as conn:
-        cur = conn.execute(
-            """INSERT INTO expenses (date, amount, category, subcategory, note, is_recurring)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (date, amount, category.strip(), subcategory.strip(), note.strip(), int(is_recurring)),
+    user_id = _get_user_id()
+    async with get_conn() as conn:
+        cur = await conn.execute(
+            """INSERT INTO expenses (date, amount, category, subcategory, note, is_recurring, user_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (date, amount, category.strip(), subcategory.strip(), note.strip(), int(is_recurring), user_id),
         )
         return {
             "id": cur.lastrowid,
@@ -129,7 +153,7 @@ def add_expense(
 
 
 @mcp.tool()
-def update_expense(
+async def update_expense(
     id: int,
     date: Optional[str] = None,
     amount: Optional[float] = None,
@@ -139,39 +163,46 @@ def update_expense(
     is_recurring: Optional[bool] = None,
 ) -> dict:
     """Update an existing expense by ID. Only the provided fields are changed."""
-    with get_conn() as conn:
-        row = conn.execute("SELECT * FROM expenses WHERE id = ?", (id,)).fetchone()
+    user_id = _get_user_id()
+    async with get_conn() as conn:
+        cursor = await conn.execute(
+            "SELECT * FROM expenses WHERE id = ? AND user_id = ?", (id, user_id)
+        )
+        row = await cursor.fetchone()
         if not row:
             raise ValueError(f"No expense with id={id}.")
 
-        new_date       = validate_date(date) if date else row["date"]
-        new_amount     = validate_amount(amount) if amount is not None else row["amount"]
-        new_category   = category.strip() if category else row["category"]
-        new_sub        = subcategory.strip() if subcategory is not None else row["subcategory"]
-        new_note       = note.strip() if note is not None else row["note"]
-        new_recurring  = int(is_recurring) if is_recurring is not None else row["is_recurring"]
+        new_date      = validate_date(date) if date else row["date"]
+        new_amount    = validate_amount(amount) if amount is not None else row["amount"]
+        new_category  = category.strip() if category else row["category"]
+        new_sub       = subcategory.strip() if subcategory is not None else row["subcategory"]
+        new_note      = note.strip() if note is not None else row["note"]
+        new_recurring = int(is_recurring) if is_recurring is not None else row["is_recurring"]
 
-        conn.execute(
+        await conn.execute(
             """UPDATE expenses
                SET date=?, amount=?, category=?, subcategory=?, note=?, is_recurring=?
-               WHERE id=?""",
-            (new_date, new_amount, new_category, new_sub, new_note, new_recurring, id),
+               WHERE id=? AND user_id=?""",
+            (new_date, new_amount, new_category, new_sub, new_note, new_recurring, id, user_id),
         )
         return {"id": id, "status": "updated"}
 
 
 @mcp.tool()
-def delete_expense(id: int) -> dict:
+async def delete_expense(id: int) -> dict:
     """Delete an expense by ID."""
-    with get_conn() as conn:
-        cur = conn.execute("DELETE FROM expenses WHERE id = ?", (id,))
+    user_id = _get_user_id()
+    async with get_conn() as conn:
+        cur = await conn.execute(
+            "DELETE FROM expenses WHERE id = ? AND user_id = ?", (id, user_id)
+        )
         if cur.rowcount == 0:
             raise ValueError(f"No expense with id={id}.")
         return {"id": id, "status": "deleted"}
 
 
 @mcp.tool()
-def list_expenses(
+async def list_expenses(
     start_date: str,
     end_date: str,
     category: Optional[str] = None,
@@ -181,8 +212,9 @@ def list_expenses(
     validate_date(start_date)
     validate_date(end_date)
 
-    query = "SELECT * FROM expenses WHERE date BETWEEN ? AND ?"
-    params: list = [start_date, end_date]
+    user_id = _get_user_id()
+    query = "SELECT * FROM expenses WHERE user_id = ? AND date BETWEEN ? AND ?"
+    params: list = [user_id, start_date, end_date]
 
     if category:
         query += " AND category = ?"
@@ -192,59 +224,65 @@ def list_expenses(
 
     query += " ORDER BY date DESC, id DESC"
 
-    with get_conn() as conn:
-        return rows_to_dicts(conn.execute(query, params))
+    async with get_conn() as conn:
+        cursor = await conn.execute(query, params)
+        return await rows_to_dicts(cursor)
 
 
 @mcp.tool()
-def summarize(start_date: str, end_date: str, category: Optional[str] = None) -> list[dict]:
+async def summarize(start_date: str, end_date: str, category: Optional[str] = None) -> list[dict]:
     """Summarize total spending per category within a date range."""
     validate_date(start_date)
     validate_date(end_date)
 
+    user_id = _get_user_id()
     query = """
         SELECT category,
                SUM(amount)  AS total_amount,
                COUNT(*)     AS num_transactions
         FROM expenses
-        WHERE date BETWEEN ? AND ?
+        WHERE user_id = ? AND date BETWEEN ? AND ?
     """
-    params: list = [start_date, end_date]
+    params: list = [user_id, start_date, end_date]
     if category:
         query += " AND category = ?"
         params.append(category)
     query += " GROUP BY category ORDER BY total_amount DESC"
 
-    with get_conn() as conn:
-        return rows_to_dicts(conn.execute(query, params))
+    async with get_conn() as conn:
+        cursor = await conn.execute(query, params)
+        return await rows_to_dicts(cursor)
 
 
 # ── budget tools ──────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def set_budget(category: str, month: str, amount: float) -> dict:
+async def set_budget(category: str, month: str, amount: float) -> dict:
     """Set or update a monthly budget for a category. month must be YYYY-MM."""
     validate_month(month)
     validate_amount(amount)
     if not category.strip():
         raise ValueError("category cannot be empty.")
 
-    with get_conn() as conn:
-        conn.execute(
-            """INSERT INTO budgets (category, month, amount) VALUES (?, ?, ?)
-               ON CONFLICT(category, month) DO UPDATE SET amount = excluded.amount""",
-            (category.strip(), month, amount),
+    user_id = _get_user_id()
+    async with get_conn() as conn:
+        await conn.execute(
+            """INSERT INTO budgets (category, month, amount, user_id) VALUES (?, ?, ?, ?)
+               ON CONFLICT(user_id, category, month) DO UPDATE SET amount = excluded.amount""",
+            (category.strip(), month, amount, user_id),
         )
         return {"status": "set", "category": category, "month": month, "budget": amount}
 
 
 @mcp.tool()
-def delete_budget(category: str, month: str) -> dict:
+async def delete_budget(category: str, month: str) -> dict:
     """Remove a budget entry for a category and month (YYYY-MM)."""
     validate_month(month)
-    with get_conn() as conn:
-        cur = conn.execute(
-            "DELETE FROM budgets WHERE category = ? AND month = ?", (category, month)
+    user_id = _get_user_id()
+    async with get_conn() as conn:
+        cur = await conn.execute(
+            "DELETE FROM budgets WHERE category = ? AND month = ? AND user_id = ?",
+            (category, month, user_id),
         )
         if cur.rowcount == 0:
             raise ValueError(f"No budget for category='{category}', month='{month}'.")
@@ -252,21 +290,25 @@ def delete_budget(category: str, month: str) -> dict:
 
 
 @mcp.tool()
-def list_budgets(month: str) -> list[dict]:
+async def list_budgets(month: str) -> list[dict]:
     """List all budgets set for a given month (YYYY-MM)."""
     validate_month(month)
-    with get_conn() as conn:
-        return rows_to_dicts(
-            conn.execute("SELECT * FROM budgets WHERE month = ? ORDER BY category", (month,))
+    user_id = _get_user_id()
+    async with get_conn() as conn:
+        cursor = await conn.execute(
+            "SELECT * FROM budgets WHERE month = ? AND user_id = ? ORDER BY category",
+            (month, user_id),
         )
+        return await rows_to_dicts(cursor)
 
 
 @mcp.tool()
-def budget_status(month: str) -> list[dict]:
+async def budget_status(month: str) -> list[dict]:
     """Compare actual spending vs budget for every budgeted category in a month."""
     validate_month(month)
-    with get_conn() as conn:
-        rows = rows_to_dicts(conn.execute(
+    user_id = _get_user_id()
+    async with get_conn() as conn:
+        cursor = await conn.execute(
             """
             SELECT
                 b.category,
@@ -278,87 +320,97 @@ def budget_status(month: str) -> list[dict]:
             FROM budgets b
             LEFT JOIN expenses e
                 ON  e.category = b.category
+                AND e.user_id  = b.user_id
                 AND strftime('%Y-%m', e.date) = b.month
-            WHERE b.month = ?
+            WHERE b.month = ? AND b.user_id = ?
             GROUP BY b.category
             ORDER BY pct_used DESC
             """,
-            (month,),
-        ))
-        for row in rows:
-            row["status"] = "over_budget" if row["spent"] > row["budget"] else "ok"
-        return rows
+            (month, user_id),
+        )
+        rows = await rows_to_dicts(cursor)
+    for row in rows:
+        row["status"] = "over_budget" if row["spent"] > row["budget"] else "ok"
+    return rows
 
 
 # ── analytics ─────────────────────────────────────────────────────────────────
 
 @mcp.tool()
-def monthly_trend(months: int = 6, category: Optional[str] = None) -> list[dict]:
+async def monthly_trend(months: int = 6, category: Optional[str] = None) -> list[dict]:
     """Show month-by-month spending totals for the last N months (max 24)."""
     if not 1 <= months <= 24:
         raise ValueError("months must be between 1 and 24.")
 
+    user_id = _get_user_id()
     query = """
         SELECT strftime('%Y-%m', date) AS month,
                SUM(amount)             AS total,
                COUNT(*)                AS num_transactions
         FROM expenses
-        WHERE date >= date('now', ? || ' months')
+        WHERE user_id = ? AND date >= date('now', ? || ' months')
     """
-    params: list = [f"-{months}"]
+    params: list = [user_id, f"-{months}"]
     if category:
         query += " AND category = ?"
         params.append(category)
     query += " GROUP BY month ORDER BY month ASC"
 
-    with get_conn() as conn:
-        return rows_to_dicts(conn.execute(query, params))
+    async with get_conn() as conn:
+        cursor = await conn.execute(query, params)
+        return await rows_to_dicts(cursor)
 
 
 @mcp.tool()
-def top_categories(start_date: str, end_date: str, limit: int = 5) -> list[dict]:
+async def top_categories(start_date: str, end_date: str, limit: int = 5) -> list[dict]:
     """Return the top spending categories in a date range."""
     validate_date(start_date)
     validate_date(end_date)
     if limit < 1:
         raise ValueError("limit must be at least 1.")
 
-    with get_conn() as conn:
-        return rows_to_dicts(conn.execute(
+    user_id = _get_user_id()
+    async with get_conn() as conn:
+        cursor = await conn.execute(
             """
             SELECT category,
-                   SUM(amount)        AS total,
-                   COUNT(*)           AS num_transactions,
+                   SUM(amount)           AS total,
+                   COUNT(*)              AS num_transactions,
                    ROUND(AVG(amount), 2) AS avg_transaction
             FROM expenses
-            WHERE date BETWEEN ? AND ?
+            WHERE user_id = ? AND date BETWEEN ? AND ?
             GROUP BY category
             ORDER BY total DESC
             LIMIT ?
             """,
-            (start_date, end_date, limit),
-        ))
+            (user_id, start_date, end_date, limit),
+        )
+        return await rows_to_dicts(cursor)
 
 
 @mcp.tool()
-def spending_insights(month: str) -> dict:
+async def spending_insights(month: str) -> dict:
     """Full spending breakdown for a month: totals, per-category, budget status, daily average."""
     validate_month(month)
-    with get_conn() as conn:
-        total_row = conn.execute(
+    user_id = _get_user_id()
+    async with get_conn() as conn:
+        cursor = await conn.execute(
             """SELECT COALESCE(SUM(amount), 0) AS total, COUNT(*) AS count
-               FROM expenses WHERE strftime('%Y-%m', date) = ?""",
-            (month,),
-        ).fetchone()
+               FROM expenses WHERE user_id = ? AND strftime('%Y-%m', date) = ?""",
+            (user_id, month),
+        )
+        total_row = await cursor.fetchone()
+        assert total_row is not None
 
-        by_category = rows_to_dicts(conn.execute(
+        cursor = await conn.execute(
             """SELECT category, SUM(amount) AS total, COUNT(*) AS count
-               FROM expenses WHERE strftime('%Y-%m', date) = ?
+               FROM expenses WHERE user_id = ? AND strftime('%Y-%m', date) = ?
                GROUP BY category ORDER BY total DESC""",
-            (month,),
-        ))
+            (user_id, month),
+        )
+        by_category = await rows_to_dicts(cursor)
 
-        budget_rows = rows_to_dicts(conn.execute(
+        cursor = await conn.execute(
             """
             SELECT b.category,
                    b.amount                              AS budget,
@@ -367,24 +419,29 @@ def spending_insights(month: str) -> dict:
             FROM budgets b
             LEFT JOIN expenses e
                 ON  e.category = b.category
+                AND e.user_id  = b.user_id
                 AND strftime('%Y-%m', e.date) = b.month
-            WHERE b.month = ?
+            WHERE b.month = ? AND b.user_id = ?
             GROUP BY b.category
             """,
-            (month,),
-        ))
+            (month, user_id),
+        )
+        budget_rows = await rows_to_dicts(cursor)
 
-        active_days = conn.execute(
-            "SELECT COUNT(DISTINCT date) AS d FROM expenses WHERE strftime('%Y-%m', date) = ?",
-            (month,),
-        ).fetchone()["d"]
+        cursor = await conn.execute(
+            """SELECT COUNT(DISTINCT date) AS d FROM expenses
+               WHERE user_id = ? AND strftime('%Y-%m', date) = ?""",
+            (user_id, month),
+        )
+        active_days_row = await cursor.fetchone()
+        assert active_days_row is not None
 
     total = total_row["total"]
     return {
         "month": month,
         "total_spent": total,
         "total_transactions": total_row["count"],
-        "daily_average": round(total / max(active_days, 1), 2),
+        "daily_average": round(total / max(active_days_row["d"], 1), 2),
         "by_category": by_category,
         "budget_status": budget_rows,
     }
@@ -393,35 +450,36 @@ def spending_insights(month: str) -> dict:
 # ── category management ───────────────────────────────────────────────────────
 
 @mcp.tool()
-def add_category(name: str, parent: Optional[str] = None) -> dict:
+async def add_category(name: str, parent: Optional[str] = None) -> dict:
     """Add a new expense category, optionally nested under a parent category."""
     if not name.strip():
         raise ValueError("name cannot be empty.")
-    with get_conn() as conn:
+    async with get_conn() as conn:
         try:
-            conn.execute(
+            await conn.execute(
                 "INSERT INTO categories (name, parent) VALUES (?, ?)",
                 (name.strip(), parent.strip() if parent else None),
             )
-        except sqlite3.IntegrityError:
+        except aiosqlite.IntegrityError:
             raise ValueError(f"Category '{name}' already exists.")
         return {"status": "added", "name": name, "parent": parent}
 
 
 @mcp.tool()
-def list_categories() -> list[dict]:
+async def list_categories() -> list[dict]:
     """List all expense categories with their parent (if any)."""
-    with get_conn() as conn:
-        return rows_to_dicts(conn.execute(
+    async with get_conn() as conn:
+        cursor = await conn.execute(
             "SELECT name, parent FROM categories ORDER BY parent, name"
-        ))
+        )
+        return await rows_to_dicts(cursor)
 
 
 @mcp.tool()
-def delete_category(name: str) -> dict:
+async def delete_category(name: str) -> dict:
     """Delete a category by name."""
-    with get_conn() as conn:
-        cur = conn.execute("DELETE FROM categories WHERE name = ?", (name,))
+    async with get_conn() as conn:
+        cur = await conn.execute("DELETE FROM categories WHERE name = ?", (name,))
         if cur.rowcount == 0:
             raise ValueError(f"Category '{name}' not found.")
         return {"status": "deleted", "name": name}
@@ -430,12 +488,13 @@ def delete_category(name: str) -> dict:
 # ── resource ──────────────────────────────────────────────────────────────────
 
 @mcp.resource("expense://categories", mime_type="application/json")
-def categories_resource() -> str:
+async def categories_resource() -> str:
     """All categories as JSON, grouped by parent."""
-    with get_conn() as conn:
-        rows = rows_to_dicts(conn.execute(
+    async with get_conn() as conn:
+        cursor = await conn.execute(
             "SELECT name, parent FROM categories ORDER BY parent, name"
-        ))
+        )
+        rows = await rows_to_dicts(cursor)
     return json.dumps(rows, indent=2)
 
 
