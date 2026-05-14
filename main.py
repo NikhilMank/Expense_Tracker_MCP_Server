@@ -1,7 +1,6 @@
 import os
 import json
 import aiosqlite
-import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Optional
@@ -15,10 +14,15 @@ from fastmcp.server.dependencies import get_access_token
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "expenses.db")
 CATEGORIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "categories.json")
 
-mcp = FastMCP("Expense-Tracker")
+mcp = FastMCP("Expense-Tracker", lifespan="auto")
 
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── lifespan (startup/shutdown) ───────────────────────────────────────────────
+
+@mcp.lifecycle
+async def lifespan(server: FastMCP):
+    await init_db()
+    yield
 
 @asynccontextmanager
 async def get_conn():
@@ -114,9 +118,6 @@ async def init_db():
                         "INSERT OR IGNORE INTO categories (name, parent) VALUES (?, ?)",
                         (child, parent),
                     )
-
-
-asyncio.run(init_db())
 
 
 # ── expense CRUD ──────────────────────────────────────────────────────────────
