@@ -4,6 +4,8 @@ A remote MCP server for tracking personal expenses with budget management and an
 
 ## Connect to the Server
 
+> **Authentication is required.** This deployment has Authorization enabled on fastmcp.cloud, so users must sign in with their fastmcp.cloud account to access the server.
+
 Your server is deployed at:
 ```
 https://nikhilmankali-expense-server.fastmcp.app/mcp
